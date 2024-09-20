@@ -36,6 +36,11 @@ class DtoModels:
             name: str
             routeNumber: str
             busRouteStopList: List["DtoModels.GetBusRoutes.StopLine"]
+            _wrapper:'Optional[RtlWrapper]'
+            
+            def GetProducts(self) -> 'DtoModels.GetProductDetails':
+                return self._wrapper.GetProductDetails(routeCode=self.code, type='bus')
+        
 
         @dataclass
         class StopLine:
@@ -54,7 +59,7 @@ class DtoModels:
     @dataclass
     class GetVesselRoutes:
         routeResponse:List['DtoModels.GetVesselRoutes.Line']
-            
+        
         @dataclass
         class Line:
             id:int
@@ -63,6 +68,10 @@ class DtoModels:
             routeNumber:str
             fare:float
             stopList:List['DtoModels.GetVesselRoutes.StopLine']
+            _wrapper:'Optional[RtlWrapper]'
+            
+            def GetProducts(self) -> 'DtoModels.GetProductDetails':
+                return self._wrapper.GetProductDetails(routeCode=self.code, type='vessel')
         
         @dataclass
         class StopLine:
@@ -106,7 +115,7 @@ class DtoModels:
             vehicleType: int
             description: Optional[str]
             fare: float
-            isDistanceFareType: int
+            isDistanceFareType: Optional[int]
             distanceFareComponent: Optional[str]
             validRoutes: List["DtoModels.GetProductDetails.Routes"]
 
@@ -257,22 +266,25 @@ class RtlWrapper:
         endpoint = "https://bo.rtl.mv:4455/maldives/api/booking/v2/bus/routedetails".format(type)
         headers = self._get_headers()
         response = requests.get(endpoint, headers=headers, timeout=10)
-        return from_dict(
+        return_obj = from_dict(
             data_class=DtoModels.GetBusRoutes,
             data=response.json(),
             config=Config(strict_unions_match=False),
         )
+        for x in return_obj.routeResponse: x._wrapper = self
+        return return_obj
         
     def GetVesselRoutes(self) -> DtoModels.GetVesselRoutes:
         endpoint = "https://bo.rtl.mv:4455/maldives/api/booking/v2/vessel/routedetails".format(type)
         headers = self._get_headers()
         response = requests.get(endpoint, headers=headers, timeout=10)
-        print(response.content)
-        return from_dict(
+        return_obj = from_dict(
             data_class=DtoModels.GetVesselRoutes,
             data=response.json(),
             config=Config(strict_unions_match=False),
         )
+        for x in return_obj.routeResponse: x._wrapper = self
+        return return_obj
 
     def GetLiveCoordinates(self, routeCode: str) -> DtoModels.GetLiveCoordinates:
         endpoint = "https://bo.rtl.mv:4455/maldives/api/booking/v1/bus/livecoordinates"
@@ -285,15 +297,16 @@ class RtlWrapper:
             config=Config(strict_unions_match=False),
         )
 
-    def GetBusProductDetails(self, routeCode: str, type:str = 'bus') -> DtoModels.GetProductDetails:
+    def GetProductDetails(self, routeCode: str, type:str = 'bus') -> DtoModels.GetProductDetails:
         endpoint = "https://bo.rtl.mv:4455/maldives/api/booking/v1/{}/productdetails".format(type)
         payload = json.dumps({"routeCode": routeCode, "deviceType": 0})
         headers = self._get_headers(payload)
         response = requests.post(endpoint, data=payload, headers=headers, timeout=10)
         if response.status_code == 500:
             raise Exceptions.BlankDataException("[500] You probably sent an invalid route code")
-        return from_dict(
+        return_obj = from_dict(
             data_class=DtoModels.GetProductDetails,
             data=response.json(),
             config=Config(strict_unions_match=False),
         )
+        return return_obj
