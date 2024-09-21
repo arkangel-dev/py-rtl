@@ -1,23 +1,39 @@
 import base64
 import json
+import urllib.parse
 import requests
 import jwt
 import time
 import os
 
 from typing import List, Optional
+from urllib import parse
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 from dataclasses import dataclass, fields, MISSING
 from dacite import from_dict, Config
+from enum import Enum
+
+class Constants:
+    class VehicleType(str, Enum):
+        BUS = 'bus'
+        VESSEL = 'vessel'
 
 class Exceptions:
     class BlankDataException(Exception):
         def __init__(self, message):
             super().__init__(message)
             
-    class NoCardAvailable(Exception):
+    class NoCardAvailableException(Exception):
+        def __init__(self, message):
+            super().__init__(message)
+            
+    class TicketNotFoundException(Exception):
+        def __init__(self, message):
+            super().__init__(message)
+            
+    class NotFoundException(Exception):
         def __init__(self, message):
             super().__init__(message)
 
@@ -62,10 +78,10 @@ class DtoModels:
 
     @dataclass
     class GetVesselRoutes:
-        routeResponse:List['DtoModels.GetVesselRoutes.Line']
+        routeResponse:List['DtoModels.GetVesselRoutes.VesselLine']
         
         @dataclass
-        class Line:
+        class VesselLine:
             id:int
             code:str
             name:str
@@ -103,10 +119,10 @@ class DtoModels:
         code: str
         name: str
         routeNumber: str
-        products: List["DtoModels.GetProductDetails.Products"]
+        products: List["DtoModels.GetProductDetails.Product"]
 
         @dataclass
-        class Products:
+        class Product:
             id: int
             code: str
             label: str
@@ -121,25 +137,25 @@ class DtoModels:
             fare: float
             isDistanceFareType: Optional[int]
             distanceFareComponent: Optional[str]
-            validRoutes: List["DtoModels.GetProductDetails.Routes"]
+            validRoutes: List["DtoModels.Routes"]
             _wrapper:'Optional[RtlWrapper]'
             _parent:'Optional[DtoModels.GetProductDetails]'
             
-            def PurchaseTicket(self):
+            def PurchaseTicket(self) -> 'DtoModels.BookingTicket':
                 ticket = self._wrapper.BookTicket(productCode=self.code, routeCode=self._parent.code)
                 url_resp = self._wrapper.PayBooking(ticket=ticket)
-                print(ticket.bookingId)
                 try:
                     requests.get(url_resp.url, timeout=10)
                 except requests.exceptions.InvalidSchema:
                     pass
-
-        @dataclass
-        class Routes:
-            id: int
-            code: str
-            name: str
-            routeNumber: str
+                return self._wrapper.GetTicket(bookingId=ticket.bookingId)
+                
+    @dataclass
+    class Routes:
+        id: int
+        code: str
+        name: str
+        routeNumber: str
 
     @dataclass
     class BookTicketResult:
@@ -160,6 +176,41 @@ class DtoModels:
     class PaymentResult:
         url:str
 
+    @dataclass
+    class BookingTicket:
+        bookingId:str
+        boookingDate:str
+        productCode:Optional[str]
+        productName:str
+        dvproductName:str
+        routeName:str
+        dvrouteName:str
+        routeCode:Optional[str]
+        routeNumber:str
+        totalAmount:float
+        qrType:str
+        status:int
+        remainingTripsCount:int
+        validityInDays:Optional[int]
+        validRoutes:'List[DtoModels.Routes]'
+        tickets:'List[DtoModels.Ticket]'
+    
+    @dataclass
+    class Ticket:
+        serialNumber:str
+        tripCount:int
+        ticketFare:float
+        expirationDate:str
+        qrContent:str
+        status:int
+        completedTrips:int
+        
+    @dataclass
+    class TicketPagination:
+        content:'List[DtoModels.BookingTicket]'
+        last:bool
+        
+        
 class RtlWrapper:
     login_enc_key: str
     login_enc_iv: str
@@ -269,12 +320,10 @@ class RtlWrapper:
         """Check if the cached token is valid. And if it is not, login"""
         self.jwt_token = self._read_token_from_file()
         if self.jwt_token and not self._is_token_expired(self.jwt_token):
-            print("Token is valid.")
+            return
         else:
-            print("Token is expired or doesn't exist. Logging in again.")
             new_token = self.Login()
             self._write_token_to_file(new_token)
-            print("New token saved.")
 
     def Login(self) -> str:
         """Login and get a JWT key
@@ -330,7 +379,7 @@ class RtlWrapper:
             config=Config(strict_unions_match=False),
         )
 
-    def GetProductDetails(self, routeCode: str, type:str = 'bus') -> DtoModels.GetProductDetails:
+    def GetProductDetails(self, routeCode: str, type:Constants.VehicleType = Constants.VehicleType.BUS) -> DtoModels.GetProductDetails:
         endpoint = "https://bo.rtl.mv:4455/maldives/api/booking/v1/{}/productdetails".format(type)
         payload = json.dumps({"routeCode": routeCode, "deviceType": 0})
         headers = self._get_headers(payload)
@@ -369,7 +418,7 @@ class RtlWrapper:
         endpoint = "https://bo.rtl.mv:4455/maldives/api/booking/v1/vessel/payment"
         if cardId is None:
             firstCard = next(iter(ticket.paddedCardNumbers), None)
-            if firstCard is None: raise Exceptions.NoCardAvailable('There are no cards available')
+            if firstCard is None: raise Exceptions.NoCardAvailableException('There are no cards available')
             cardId = firstCard.cardId
         payload = json.dumps({
             "bookingId": ticket.bookingId,
@@ -379,11 +428,45 @@ class RtlWrapper:
         })
         headers = self._get_headers(payload)
         response = requests.post(endpoint, data=payload, headers=headers, timeout=10)
-        print(payload)
-        print(response.content)
         return_obj = from_dict(
             data_class=DtoModels.PaymentResult,
             data=response.json(),
             config=Config(strict_unions_match=False),
         )
         return return_obj
+    
+    def GetMyTickets(self, bookingId:Optional[str] = None, page:int = 0, size:int = 5, status:Optional[int] = None) -> DtoModels.TicketPagination:
+        endpoint = "https://bo.rtl.mv:4455/maldives/api/booking/v2/vessel/booking/history"
+        params = {
+            "orderBy": "id",
+            "direction": "desc",
+            "page": page,
+            "size": size,
+        }
+        if bookingId is not None: params['bookingId'] = bookingId       
+        if status is not None: params['status'] = status
+        endpoint = endpoint + '?' + parse.urlencode(params)
+
+        headers = self._get_headers()
+        response = requests.get(endpoint, headers=headers, timeout=10)
+        return_obj = from_dict(
+            data_class=DtoModels.TicketPagination,
+            data=response.json(),
+            config=Config(strict_unions_match=False),
+        )
+        return return_obj
+
+    def GetTicket(self, bookingId:Optional[str]) -> DtoModels.BookingTicket:
+        queryResult = self.GetMyTickets(bookingId=bookingId, size=1)
+        if len(queryResult.content) == 0: raise Exceptions.TicketNotFoundException("The queried ticket was not found")
+        return queryResult.content[0]
+    
+    def GetProduct(self, route:str, product:str, type:Constants.VehicleType) -> DtoModels.GetProductDetails.Product:
+        response = self.GetBusRoutes() if type == Constants.VehicleType.BUS else self.GetVesselRoutes()
+        routeSelection = next(filter(lambda x: x.name == route, response.routeResponse), None)
+        if routeSelection is None: raise Exceptions.NotFoundException('The specified route was not found')
+
+        productSelection = next(filter(lambda x: x.label == product, routeSelection.GetProducts().products), None)
+        if productSelection is None: raise Exceptions.NotFoundException('The specified product was not found')
+        return productSelection
+    
