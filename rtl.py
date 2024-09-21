@@ -16,6 +16,10 @@ class Exceptions:
     class BlankDataException(Exception):
         def __init__(self, message):
             super().__init__(message)
+            
+    class NoCardAvailable(Exception):
+        def __init__(self, message):
+            super().__init__(message)
 
 class DtoModels:
 
@@ -118,6 +122,17 @@ class DtoModels:
             isDistanceFareType: Optional[int]
             distanceFareComponent: Optional[str]
             validRoutes: List["DtoModels.GetProductDetails.Routes"]
+            _wrapper:'Optional[RtlWrapper]'
+            _parent:'Optional[DtoModels.GetProductDetails]'
+            
+            def PurchaseTicket(self):
+                ticket = self._wrapper.BookTicket(productCode=self.code, routeCode=self._parent.code)
+                url_resp = self._wrapper.PayBooking(ticket=ticket)
+                print(ticket.bookingId)
+                try:
+                    requests.get(url_resp.url, timeout=10)
+                except requests.exceptions.InvalidSchema:
+                    pass
 
         @dataclass
         class Routes:
@@ -126,6 +141,24 @@ class DtoModels:
             name: str
             routeNumber: str
 
+    @dataclass
+    class BookTicketResult:
+        message:str
+        bookingId:str
+        bookingDate:str
+        isTokenized:int
+        walletStatus:int
+        walletBalance:Optional[str]
+        paddedCardNumbers:'List[DtoModels.BookTicketResult.CardNumber]'
+        
+        @dataclass
+        class CardNumber:
+            cardId:int
+            cardNumber:str
+
+    @dataclass
+    class PaymentResult:
+        url:str
 
 class RtlWrapper:
     login_enc_key: str
@@ -306,6 +339,50 @@ class RtlWrapper:
             raise Exceptions.BlankDataException("[500] You probably sent an invalid route code")
         return_obj = from_dict(
             data_class=DtoModels.GetProductDetails,
+            data=response.json(),
+            config=Config(strict_unions_match=False),
+        )
+        for p in return_obj.products:
+            p._parent = return_obj
+            p._wrapper = self
+        return return_obj
+    
+    def BookTicket(self, routeCode: str, productCode:str, count:int = 1) -> DtoModels.BookTicketResult:
+        endpoint = "https://bo.rtl.mv:4455/maldives/api/booking/v1/vessel/bookticket"
+        payload = json.dumps({
+                "routeCode": routeCode,
+                "productCode": productCode,
+                "ticketCount": count,
+                "email": self.email,
+                "deviceType": 0,
+            })
+        headers = self._get_headers(payload)
+        response = requests.post(endpoint, data=payload, headers=headers, timeout=10)
+        return_obj = from_dict(
+            data_class=DtoModels.BookTicketResult,
+            data=response.json(),
+            config=Config(strict_unions_match=False),
+        )
+        return return_obj
+    
+    def PayBooking(self, ticket:DtoModels.BookTicketResult, cardId:Optional[int] = None):
+        endpoint = "https://bo.rtl.mv:4455/maldives/api/booking/v1/vessel/payment"
+        if cardId is None:
+            firstCard = next(iter(ticket.paddedCardNumbers), None)
+            if firstCard is None: raise Exceptions.NoCardAvailable('There are no cards available')
+            cardId = firstCard.cardId
+        payload = json.dumps({
+            "bookingId": ticket.bookingId,
+            "cardId": cardId,
+            "paymentType": 1,
+            "tokenize": 2
+        })
+        headers = self._get_headers(payload)
+        response = requests.post(endpoint, data=payload, headers=headers, timeout=10)
+        print(payload)
+        print(response.content)
+        return_obj = from_dict(
+            data_class=DtoModels.PaymentResult,
             data=response.json(),
             config=Config(strict_unions_match=False),
         )
