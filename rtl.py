@@ -5,8 +5,10 @@ import requests
 import jwt
 import time
 import os
+import threading
+import math
 
-from typing import List, Optional
+from typing import List, Optional, Callable
 from urllib import parse
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -19,6 +21,9 @@ class Constants:
     class VehicleType(str, Enum):
         BUS = 'bus'
         VESSEL = 'vessel'
+    
+        def __str__(self):
+            return self.name.lower()
 
 class Exceptions:
     class BlankDataException(Exception):
@@ -40,28 +45,27 @@ class Exceptions:
 class DtoModels:
 
     @dataclass
-    class GetBusRoutes:
-        routeResponse: List["DtoModels.GetBusRoutes.BusLines"]
-
+    class BusRouteResult:
+        routeResponse: List["DtoModels.BusRouteResult.BusLine"]
+        atollRouteResponse: List["DtoModels.BusRouteResult.AtollLines"]
         @dataclass
         class AtollLines:
             name: str
             code: str
-            routeResponse: List["DtoModels.GetBusRoutes.BusLines"]
+            routeResponse: List["DtoModels.BusRouteResult.BusLine"]
 
         @dataclass
-        class BusLines:
+        class BusLine:
             id: int
             code: str
             name: str
             routeNumber: str
-            busRouteStopList: List["DtoModels.GetBusRoutes.StopLine"]
+            busRouteStopList: List["DtoModels.BusRouteResult.StopLine"]
             _wrapper:'Optional[RtlWrapper]'
             
             def GetProducts(self) -> 'DtoModels.GetProductDetails':
                 return self._wrapper.GetProductDetails(routeCode=self.code, type='bus')
         
-
         @dataclass
         class StopLine:
             id: int
@@ -69,7 +73,7 @@ class DtoModels:
             name: str
             latitude: str
             longitude: str
-            timings: List["DtoModels.GetBusRoutes.Timings"]
+            timings: List["DtoModels.BusRouteResult.Timings"]
 
         @dataclass
         class Timings:
@@ -77,8 +81,8 @@ class DtoModels:
             timing: str
 
     @dataclass
-    class GetVesselRoutes:
-        routeResponse:List['DtoModels.GetVesselRoutes.VesselLine']
+    class VesselRouteResult:
+        routeResponse:List['DtoModels.VesselRouteResult.VesselLine']
         
         @dataclass
         class VesselLine:
@@ -87,7 +91,7 @@ class DtoModels:
             name:str
             routeNumber:str
             fare:float
-            stopList:List['DtoModels.GetVesselRoutes.StopLine']
+            stopList:List['DtoModels.VesselRouteResult.StopLine']
             _wrapper:'Optional[RtlWrapper]'
             
             def GetProducts(self) -> 'DtoModels.GetProductDetails':
@@ -344,32 +348,38 @@ class RtlWrapper:
         self.jwt_token = response.json()["jwt"]
         return self.jwt_token
 
-    def GetBusRoutes(self) -> DtoModels.GetBusRoutes:
+    def GetBusRoutes(self) -> List[DtoModels.BusRouteResult.BusLine]:
         endpoint = "https://bo.rtl.mv:4455/maldives/api/booking/v2/bus/routedetails".format(type)
         headers = self._get_headers()
         response = requests.get(endpoint, headers=headers, timeout=10)
         return_obj = from_dict(
-            data_class=DtoModels.GetBusRoutes,
+            data_class=DtoModels.BusRouteResult,
             data=response.json(),
             config=Config(strict_unions_match=False),
         )
-        for x in return_obj.routeResponse: x._wrapper = self
-        return return_obj
+        result:List[DtoModels.BusRouteResult.BusLine] = []
         
-    def GetVesselRoutes(self) -> DtoModels.GetVesselRoutes:
+        result.extend(return_obj.routeResponse)
+        for atoll in return_obj.atollRouteResponse:
+            result.extend(atoll.routeResponse)
+        
+        for x in result: x._wrapper = self
+        return result
+        
+    def GetVesselRoutes(self) -> List[DtoModels.VesselRouteResult.VesselLine]:
         endpoint = "https://bo.rtl.mv:4455/maldives/api/booking/v2/vessel/routedetails".format(type)
         headers = self._get_headers()
         response = requests.get(endpoint, headers=headers, timeout=10)
         return_obj = from_dict(
-            data_class=DtoModels.GetVesselRoutes,
+            data_class=DtoModels.VesselRouteResult,
             data=response.json(),
             config=Config(strict_unions_match=False),
         )
         for x in return_obj.routeResponse: x._wrapper = self
-        return return_obj
+        return return_obj.routeResponse
 
-    def GetLiveCoordinates(self, routeCode: str) -> DtoModels.GetLiveCoordinates:
-        endpoint = "https://bo.rtl.mv:4455/maldives/api/booking/v1/bus/livecoordinates"
+    def GetLiveCoordinates(self, routeCode: str, type: Constants.VehicleType = Constants.VehicleType.BUS) -> DtoModels.GetLiveCoordinates:
+        endpoint = "https://bo.rtl.mv:4455/maldives/api/booking/v1/{}/livecoordinates".format(type)
         payload = json.dumps({"routeCode": routeCode})
         headers = self._get_headers(payload)
         response = requests.post(endpoint, data=payload, headers=headers, timeout=10)
@@ -463,10 +473,81 @@ class RtlWrapper:
     
     def GetProduct(self, route:str, product:str, type:Constants.VehicleType) -> DtoModels.GetProductDetails.Product:
         response = self.GetBusRoutes() if type == Constants.VehicleType.BUS else self.GetVesselRoutes()
-        routeSelection = next(filter(lambda x: x.name == route, response.routeResponse), None)
+        routeSelection = next(filter(lambda x: x.name == route, response), None)
         if routeSelection is None: raise Exceptions.NotFoundException('The specified route was not found')
 
         productSelection = next(filter(lambda x: x.label == product, routeSelection.GetProducts().products), None)
         if productSelection is None: raise Exceptions.NotFoundException('The specified product was not found')
         return productSelection
     
+    _monitoringParams:'List[LiveMonitoring.Parameter]' = []
+    _monitoringThread:'Optional[threading.Thread]' = None
+    def _monitorFunc(self):
+        while True:
+            for parameter in self._monitoringParams:
+                busResults:List[DtoModels.GetLiveCoordinates.Line] = []
+                
+                for route in parameter.routes:
+                    r = self.GetLiveCoordinates(route)
+
+                    for bus in r.busList:
+                        dist = self._haversine(
+                            parameter.coordinates,
+                            [bus.latitude, bus.longitude]
+                        )
+                        if (dist <= parameter.distance):
+                            _event = LiveMonitoring.Event()
+                            _event.vehicleCode = bus.busCode
+                            _event.longtitude = bus.longitude
+                            _event.lattitude = bus.latitude
+                            _event.parameter = parameter
+                            _event.distance = dist
+                            parameter.callback(_event)
+            time.sleep(5)
+    
+    @staticmethod
+    def _haversine(coord1: tuple[float, float], coord2: tuple[float, float]):
+        # Radius of the Earth in kilometers
+        R = 6371.0
+
+        # Coordinates in decimal degrees
+        lat1, lon1 = coord1
+        lat2, lon2 = coord2
+
+        lat1 = math.radians(lat1)
+        lon1 = math.radians(lon1)
+        lat2 = math.radians(lat2)
+        lon2 = math.radians(lon2)
+
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        a = math.sin(dlat / 2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2)**2
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        distance = R * c
+
+        return distance
+    
+    def OnBusEntry(self, parameter:'LiveMonitoring.Parameter'):
+        if self._monitoringThread is None:
+            self._monitoringThread = threading.Thread(target=self._monitorFunc)
+            self._monitoringThread.daemon = True
+            self._monitoringThread.start()
+        self._monitoringParams.append(parameter)
+    
+class LiveMonitoring:
+    
+    class Parameter:
+               
+        callback:'Callable[[LiveMonitoring.Event], None]'
+        coordinates:tuple[float, float]
+        distance:float = 0.035
+        buses:Optional[List[str]] = None
+        routes:List[str] = []
+        type:Constants.VehicleType = Constants.VehicleType.BUS
+        
+    class Event:
+        vehicleCode:str
+        lattitude:float
+        longtitude:float
+        distance:float
+        parameter:'LiveMonitoring.Parameter'
